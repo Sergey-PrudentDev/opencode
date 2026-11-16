@@ -16,38 +16,27 @@ const documents = (on: boolean) => [
 ]
 
 describe("ConfigSessionSearchPlugin.Plugin", () => {
-  it.live("holds the build while the location's config turns sqlite_fts on", () => {
-    const holds = { count: 0 }
+  it.live("starts the build once the location's config turns sqlite_fts on", () => {
+    const starts = { count: 0 }
     const build = Layer.succeed(
       SessionSearchBuild.Service,
       SessionSearchBuild.Service.of({
-        hold: Effect.acquireRelease(
-          Effect.sync(() => holds.count++),
-          () => Effect.sync(() => holds.count--),
-        ).pipe(Effect.asVoid),
-        run: Effect.never,
+        start: Effect.sync(() => starts.count++),
+        run: Effect.void,
       }),
     )
-    const until = (count: number) =>
-      Effect.gen(function* () {
-        for (let attempt = 0; attempt < 200 && holds.count !== count; attempt++) yield* Effect.sleep("10 millis")
-        expect(holds.count).toBe(count)
-      })
     return Effect.gen(function* () {
       const bus = yield* Bus.Service
       const config = yield* Config.Test
       const plugins = yield* Plugin.Service
       yield* config.setEntries(documents(false))
       yield* ConfigSessionSearchPlugin.Plugin.effect(yield* PluginHost.make(plugins, "test"))
-      expect(holds.count).toBe(0)
+      expect(starts.count).toBe(0)
 
       yield* config.setEntries(documents(true))
       yield* bus.publish(Event.Updated, {})
-      yield* until(1)
-
-      yield* config.setEntries(documents(false))
-      yield* bus.publish(Event.Updated, {})
-      yield* until(0)
+      for (let attempt = 0; attempt < 200 && starts.count === 0; attempt++) yield* Effect.sleep("10 millis")
+      expect(starts.count).toBeGreaterThan(0)
     }).pipe(Effect.scoped, Effect.provide(build), Effect.provide(PluginTestLayer))
   })
 })

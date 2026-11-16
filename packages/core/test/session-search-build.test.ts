@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { sql } from "drizzle-orm"
-import { Effect, Exit, Scope } from "effect"
+import { Effect } from "effect"
 import { TestClock } from "effect/testing"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -17,15 +17,6 @@ import { testEffect } from "./lib/effect"
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, SessionSearchBuild.node])))
 
 const directory = AbsolutePath.make("/project")
-
-/** Holds the build, as a location with the flag on does, until the returned scope closes. */
-const hold = (build: SessionSearchBuild.Interface) =>
-  Effect.gen(function* () {
-    const scope = yield* Scope.make()
-    yield* build.hold.pipe(Scope.provide(scope))
-    return scope
-  })
-const release = (scope: Scope.Closeable) => Scope.close(scope, Exit.void)
 
 const setup = Effect.gen(function* () {
   const db = (yield* Database.Service).db
@@ -86,7 +77,7 @@ const failOn = (db: Database.Interface["db"], ids: string) =>
   )
 
 describe("SessionSearchBuild", () => {
-  it.effect("does nothing until held", () =>
+  it.effect("does nothing until started", () =>
     Effect.gen(function* () {
       const { db } = yield* setup
       yield* elapse
@@ -95,55 +86,66 @@ describe("SessionSearchBuild", () => {
     }),
   )
 
-  it.effect("builds while held, records it done; triggers keep it current after release", () =>
+  it.effect("builds once started and records it done; triggers keep it current", () =>
     Effect.gen(function* () {
       const { db, insert, build } = yield* setup
-      const first = yield* hold(build)
-      const second = yield* hold(build)
+      yield* build.start
+      yield* build.start
       yield* settled(db, "done")
       expect(yield* titles(db, "walrus")).toEqual(["ses_a", "ses_b", "ses_c"])
       expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "done", skipped: 0 })
-
-      // Off stops nothing: the triggers maintain the index without the build.
-      yield* release(first)
-      yield* release(second)
       yield* insert("ses_d", "Fresh narwhal plans")
       expect(yield* titles(db, "narwhal")).toEqual(["ses_d"])
     }),
   )
 
-  it.effect("skips a row that fails alone; fails when every row does, and retries only once released and held", () =>
+  it.effect("skips a row that fails alone", () =>
     Effect.gen(function* () {
       const { db, build } = yield* setup
       yield* SessionSearchIndex.ensure(db)
       yield* failOn(db, "'ses_b'")
-      const flaky = yield* hold(build)
+      yield* build.start
       yield* settled(db, "done")
       expect(yield* titles(db, "walrus")).toEqual(["ses_a", "ses_c"])
       expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "done", skipped: 1 })
-      yield* release(flaky)
+    }),
+  )
 
-      // Built again from the start, every row fails, so the build stops and records why.
-      yield* db.run("DROP TRIGGER fail_queue")
+  it.effect("fails when every row does, and records why", () =>
+    Effect.gen(function* () {
+      const { db, build } = yield* setup
+      yield* SessionSearchIndex.ensure(db)
       yield* failOn(db, "'ses_a', 'ses_b', 'ses_c'")
-      yield* db.run(sql`
-        UPDATE kv SET value = json_remove(json_set(value, '$.status', 'building', '$.phase', 'titles', '$.skipped', 0), '$.after')
-        WHERE key = 'session.search'
-      `)
-      const again = yield* hold(build)
+      yield* build.start
       yield* settled(db, "failed")
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "failed" })
+      expect(yield* SessionSearchIndex.state(db)).toMatchObject({
+        status: "failed",
+        error: expect.stringContaining("induced"),
+      })
+    }),
+  )
 
-      // Still held, it is not retried; released and held again, it is.
-      yield* db.run("DROP TRIGGER fail_queue")
-      yield* elapse
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "failed" })
-      yield* release(again)
-      const retried = yield* hold(build)
+  it.effect("retries a build that failed before this process started", () =>
+    Effect.gen(function* () {
+      const { db, build } = yield* setup
+      yield* SessionSearchIndex.ensure(db)
+      yield* SessionSearchIndex.buildChunk(db, { limit: 1 })
+      yield* SessionSearchIndex.fail(db, "disk full")
+      yield* build.start
       yield* settled(db, "done")
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "done", skipped: 0 })
       expect(yield* titles(db, "walrus")).toEqual(["ses_a", "ses_b", "ses_c"])
-      yield* release(retried)
+    }),
+  )
+
+  it.effect("resumes from its cursor", () =>
+    Effect.gen(function* () {
+      const { db, build } = yield* setup
+      yield* SessionSearchIndex.ensure(db)
+      expect(yield* SessionSearchIndex.buildChunk(db, { limit: 1 })).toEqual({ done: false })
+      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "building", processed: 1, total: 3 })
+      yield* build.start
+      yield* settled(db, "done")
+      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "done", processed: 3, total: 3 })
     }),
   )
 
@@ -151,52 +153,9 @@ describe("SessionSearchBuild", () => {
     Effect.gen(function* () {
       const db = (yield* Database.Service).db
       const build = yield* SessionSearchBuild.Service
-      const held = yield* hold(build)
+      yield* build.start
       yield* elapse
       expect(yield* objects(db)).toBe(0)
-      yield* release(held)
-    }),
-  )
-
-  it.effect("retries a build that failed before this process started, once", () =>
-    Effect.gen(function* () {
-      const { db, build } = yield* setup
-      yield* SessionSearchIndex.ensure(db)
-      yield* SessionSearchIndex.buildChunk(db, { limit: 1 })
-      yield* SessionSearchIndex.fail(db, "disk full")
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "failed", error: "disk full" })
-      const held = yield* hold(build)
-      yield* settled(db, "done")
-      expect(yield* titles(db, "walrus")).toEqual(["ses_a", "ses_b", "ses_c"])
-      yield* release(held)
-    }),
-  )
-
-  it.effect("resumes when held again right after a release", () =>
-    Effect.gen(function* () {
-      const { db, build } = yield* setup
-      const first = yield* hold(build)
-      // Real macrotasks only: the build runs its first chunk and waits on the test clock between chunks.
-      const tick = Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 1)))
-      yield* Effect.repeat(tick, { times: 5 })
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "building" })
-      yield* release(first)
-      const second = yield* hold(build)
-      yield* settled(db, "done")
-      yield* release(second)
-    }),
-  )
-
-  it.effect("pauses when released and resumes from its cursor", () =>
-    Effect.gen(function* () {
-      const { db, build } = yield* setup
-      yield* SessionSearchIndex.ensure(db)
-      expect(yield* SessionSearchIndex.buildChunk(db, { limit: 1 })).toEqual({ done: false })
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "building", processed: 1, total: 3 })
-      const resumed = yield* hold(build)
-      yield* settled(db, "done")
-      expect(yield* SessionSearchIndex.state(db)).toMatchObject({ status: "done", processed: 3, total: 3 })
-      yield* release(resumed)
     }),
   )
 })

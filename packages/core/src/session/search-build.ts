@@ -1,22 +1,19 @@
 export * as SessionSearchBuild from "./search-build.js"
 
-import { Cause, Clock, Context, Effect, Exit, Latch, Layer, Scope } from "effect"
+import { Cause, Clock, Context, Effect, Exit, Latch, Layer } from "effect"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Database } from "../database/database.js"
 import { SessionSearchIndex } from "./search-index.js"
 
 export interface Interface {
   /**
-   * Runs the one-time build of existing history whenever a location holds it, until it is done; triggers keep the
-   * index current after that. The server forks it, like `Schedule.run`, so it runs once per server process and never
-   * in a Durable Object. Runs until interrupted.
+   * Waits for {@link start}, then runs the one-time build of existing history until it is done, from its persisted
+   * cursor; triggers keep the index current after that. The server forks it, like `Schedule.run`, so it runs once per
+   * server process and never in a Durable Object. A build that failed before is retried once.
    */
-  readonly run: Effect.Effect<never>
-  /**
-   * Marks the `sqlite_fts` flag on for the scope it runs in, as a location with the flag on does while it is
-   * loaded. The build runs while any location holds it and pauses, from its persisted cursor, when none does.
-   */
-  readonly hold: Effect.Effect<void, never, Scope.Scope>
+  readonly run: Effect.Effect<void>
+  /** Lets {@link run} go, once a location has the `sqlite_fts` flag on. Later calls do nothing. */
+  readonly start: Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionSearchBuild") {}
@@ -31,13 +28,7 @@ export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const db = (yield* Database.Service).db
-    const wanted = yield* Latch.make()
-    const released = yield* Latch.make(true)
-    const runtime = {
-      holds: 0,
-      // A failed build is retried once per process, and again each time the flag is turned off and on.
-      retry: true,
-    }
+    const started = yield* Latch.make()
 
     const build = Effect.gen(function* () {
       const started = yield* Clock.currentTimeMillis
@@ -87,18 +78,15 @@ export const layer = Layer.effect(
       }
     })
 
-    const attempt = Effect.gen(function* () {
+    const run = Effect.gen(function* () {
+      yield* started.await
       const ensured = yield* SessionSearchIndex.ensure(db)
       if (ensured.status === "unsupported") {
         yield* Effect.logWarning("session search is not supported by this SQLite", { reason: ensured.reason })
         return
       }
       if (ensured.status !== "ready" || ensured.state.status === "done") return
-      if (ensured.state.status === "failed") {
-        if (!runtime.retry) return
-        yield* SessionSearchIndex.retry(db)
-      }
-      runtime.retry = false
+      if (ensured.state.status === "failed") yield* SessionSearchIndex.retry(db)
       yield* build
     }).pipe(
       Effect.catchCauseIf(
@@ -107,36 +95,7 @@ export const layer = Layer.effect(
       ),
     )
 
-    // Each time a location holds it, attempt the build, interrupted between transactions once none does. An attempt
-    // that ends while still held waits for a release; one that a release ended goes straight back to waiting for a
-    // hold, which may already have come.
-    const run = Effect.gen(function* () {
-      yield* wanted.await
-      const ended = yield* attempt.pipe(
-        Effect.as("attempted" as const),
-        Effect.raceFirst(released.await.pipe(Effect.as("released" as const))),
-      )
-      if (ended === "attempted") yield* released.await
-    }).pipe(Effect.forever)
-
-    const hold = Effect.acquireRelease(
-      Effect.gen(function* () {
-        runtime.holds++
-        if (runtime.holds > 1) return
-        yield* released.close
-        yield* wanted.open
-      }),
-      () =>
-        Effect.gen(function* () {
-          runtime.holds--
-          if (runtime.holds > 0) return
-          runtime.retry = true
-          yield* wanted.close
-          yield* released.open
-        }),
-    )
-
-    return Service.of({ run, hold })
+    return Service.of({ run, start: started.open })
   }),
 )
 
