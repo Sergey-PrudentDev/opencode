@@ -2599,7 +2599,7 @@ export type ConfigEntry =
           artifacts?: boolean
           console_watches?: boolean
           mcp_events?: boolean
-          full_codemode?: boolean;
+          full_codemode?: boolean
           schedules?: boolean
           part_rows?: boolean
           image_generate?: boolean | { model?: string | { providerID: string; model: string; variant?: string } }
