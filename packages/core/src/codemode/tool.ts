@@ -1,17 +1,17 @@
 export * as CodeModeTool from "./tool.js"
 
 import { ToolFailure } from "@opencode/ai/effect"
-import { CodeMode, Namespace, Tool } from "@opencode/codemode"
+import { CodeMode, Namespace, Tool, toolExpression } from "@opencode/codemode"
 import type {
   Content,
   Context as ToolContext,
-  Error,
   Info,
   Metadata,
   Namespace as ToolNamespace,
   Result,
 } from "@opencode/schema/tool"
-import { Clock, Context, Effect, Ref, Schema, Semaphore } from "effect"
+import { Error } from "@opencode/schema/tool"
+import { Clock, Context, Effect, Option, Ref, Schema, Semaphore } from "effect"
 import { toSessionError } from "../session/to-session-error.js"
 import { definition, normalizedName } from "../tool/runtime.js"
 import { Permission } from "../permission.js"
@@ -57,11 +57,15 @@ type Tools = {
   [name: string]: Tool.Tool<Run> | Namespace.Namespace<Run> | Tools
 }
 
+type Before<C> = (name: string, input: unknown, context: C) => Effect.Effect<{ tool: string; input: unknown }, Error>
+
 // Per-execution parts of a runtime shared by every execution against the same inventory.
 class Run extends Context.Service<
   Run,
   {
-    readonly executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<unknown, unknown>
+    readonly before?: Before<string>
+    readonly executeTool: (name: string, tool: Info, input: unknown, key: string) => Effect.Effect<unknown, unknown>
+    readonly note?: (text: string) => void
     readonly hooks: CodeMode.Hooks
   }
 >()("@opencode/CodeModeTool/Run") {}
@@ -86,6 +90,7 @@ export const create = (
   inventory: Inventory,
   executeTool: (name: string, tool: Info, input: unknown, context: ToolContext) => Effect.Effect<Result, Error>,
   permission: Permission.Interface,
+  before?: Before<ToolContext>,
 ) => {
   return {
     name: "execute",
@@ -98,6 +103,7 @@ export const create = (
         const callIndex = yield* Ref.make(0)
         const files = yield* Ref.make<Array<CollectedFiles>>([])
         const calls = yield* Ref.make<Array<ExecuteCall>>([])
+        const notes = new Set<string>()
         const lock = Semaphore.makeUnsafe(1)
         // Each update replaces the last, so send at most one per 100 ms; a trailing one carries the latest rows.
         // A success drops a pending one when the scope closes, since the result carries the final rows.
@@ -124,6 +130,8 @@ export const create = (
           .execute(code)
           .pipe(
             Effect.provideService(Run, {
+              before: before && ((name, input) => before(name, input, context).pipe(Effect.mapError(failure))),
+              note: (text) => notes.add(text),
               executeTool: (name, tool, input) =>
                 Effect.gen(function* () {
                   const index = yield* Ref.getAndUpdate(callIndex, (index) => index + 1)
@@ -134,9 +142,7 @@ export const create = (
                     progress: () => Effect.void,
                     // A stop is the execute call's to handle: a nested call never fails it with its own error.
                     cancel: undefined,
-                  }).pipe(
-                    Effect.mapError((error) => new ToolFailure({ message: toSessionError(error).message, error })),
-                  )
+                  }).pipe(Effect.mapError(failure))
                   const content = resultContent(executed)
                   const outputFileParts = outputFiles(content)
                   if (outputFileParts.length > 0)
@@ -166,6 +172,7 @@ export const create = (
         }
         const content: Array<Content> = [
           { type: "text", text: value.output },
+          ...Array.from(notes, (text) => ({ type: "text" as const, text })),
           ...value.files.map((file) => ({
             type: "file" as const,
             uri: `data:${file.mime};base64,${file.data}`,
@@ -275,11 +282,10 @@ const runtimes = new WeakMap<Inventory, CodeMode.Runtime<Run | CodeModeExecution
 function runtime(inventory: Inventory) {
   const cached = runtimes.get(inventory)
   if (cached) return cached
-  const tools = inventoryTools(inventory)
-  const created = CodeMode.make<typeof tools, [typeof CodeModeFetch.extension]>({
-    tools,
+  const entries = inventoryTools(inventory)
+  const created = CodeMode.make<typeof entries.tools, [typeof CodeModeFetch.extension]>({
+    ...entries,
     extensions: [CodeModeFetch.extension],
-    hooks: runHooks,
   })
   runtimes.set(inventory, created)
   return created
@@ -293,17 +299,18 @@ export const check = (
   code: string,
   bindings: Readonly<Record<string, CodeMode.DataValue>>,
   limits: CodeMode.ExecutionLimits,
-  executeTool: (name: string, tool: Info, input: unknown) => Effect.Effect<Result, Error>,
+  executeTool: (name: string, tool: Info, input: unknown, key: string) => Effect.Effect<Result, Error>,
+  before?: Before<string>,
 ) =>
   CodeMode.make({
-    tools: inventoryTools(inventory),
-    hooks: runHooks,
+    ...inventoryTools(inventory),
     limits,
   })
     .execute(code, bindings)
     .pipe(
       Effect.provideService(Run, {
-        executeTool: (name, tool, input) => executeTool(name, tool, input).pipe(Effect.map(resultValue)),
+        before,
+        executeTool: (name, tool, input, key) => executeTool(name, tool, input, key).pipe(Effect.map(resultValue)),
         hooks: {},
       }),
     )
@@ -311,18 +318,54 @@ export const check = (
 function inventoryTools(inventory: Inventory) {
   // A path may carry namespace metadata, a callable tool, child tools, or all three.
   const root: ToolNode = { children: new Map() }
+  // What a plugin may rename a call to: a tool's catalog path or its registration ID.
+  const targets = new Map<string, { readonly name: string; readonly tool: Info }>()
   for (const namespace of inventory.namespaces?.values() ?? []) getNode(root, namespace.name).namespace = namespace
   for (const [name, registration] of inventory.tools) {
     const child = definition(registration)
-    getNode(root, qualifiedName(registration)).tool = Tool.make({
+    const path = qualifiedName(registration)
+    targets.set(path, { name, tool: registration })
+    targets.set(name, { name, tool: registration })
+    getNode(root, path).tool = Tool.make({
       description: child.description,
       input: child.inputSchema,
       freeform: registration.freeform !== undefined,
       output: child.outputSchema ?? Schema.NullOr(Schema.String),
-      execute: (input) => Run.use((run) => run.executeTool(name, registration, input)),
+      // A registered path always runs a tool or fails, so it is never left unclaimed.
+      execute: (input, { key }) => call(name, input, key, registration).pipe(Effect.map(Option.getOrThrow)),
     })
   }
-  return renderTools(root)
+
+  // A nested call runs the way a direct call does: plugins may edit or rename it, then the named tool runs.
+  // `registration` is missing when the program called a path with no tool.
+  const call = (name: string, input: unknown, key: string, registration?: Info) =>
+    Run.use((run) =>
+      Effect.gen(function* () {
+        const event = run.before ? yield* run.before(name, input, key) : { tool: name, input }
+        if (event.tool === name) {
+          // Left unknown: Code Mode reports it with its own suggestions.
+          if (!registration) return Option.none()
+          return Option.some(yield* run.executeTool(name, registration, event.input, key))
+        }
+        const target = targets.get(event.tool)
+        if (!target) return yield* new Error({ message: `Tool is not available for this request: ${event.tool}` })
+        if (!registration) {
+          const ran = toolExpression(qualifiedName(target.tool))
+          run.note?.(`There is no ${toolExpression(name)} tool, so this ran as ${ran}. Call ${ran} directly.`)
+        }
+        return Option.some(yield* run.executeTool(target.name, target.tool, event.input, key))
+      }),
+    )
+
+  const hooks = {
+    ...runHooks,
+    "tool.missing": (invocation) => call(invocation.name, invocation.input, invocation.key),
+  } satisfies CodeMode.Hooks<Run>
+  return { tools: renderTools(root), hooks }
+}
+
+function failure(error: Error) {
+  return new ToolFailure({ message: toSessionError(error).message, error })
 }
 
 function resultContent(executed: Result) {

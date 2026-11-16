@@ -5,7 +5,7 @@ export type { Context, Metadata, Namespace, Options, Result } from "@opencode/sc
 import { ToolDefinition, type ToolCall } from "@opencode/ai/effect"
 import type { CodeMode } from "@opencode/codemode"
 import { Tool } from "@opencode/schema/tool"
-import { Context, Effect, Layer, Ref, Result, Schema, SchemaIssue, Types } from "effect"
+import { Context, Effect, Layer, Result, Schema, SchemaIssue, Types } from "effect"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import type { Agent } from "./agent.js"
 import { CodeModeCatalog } from "./codemode/catalog.js"
@@ -181,9 +181,6 @@ const layer = Layer.effect(
       }
     })
 
-    const run = (tool: Tool.Info, name: string, input: unknown, context: Tool.Context) =>
-      beforeExecute(name, input, context).pipe(Effect.flatMap((event) => executeTool(tool, name, event.input, context)))
-
     let catalog:
       | {
           data: Data
@@ -275,8 +272,9 @@ const layer = Layer.effect(
           const codeModeTool = codeModeEnabled
             ? CodeModeTool.create(
                 codeModeInventory,
-                (name, tool, input, context) => run(tool, name, input, context),
+                (name, tool, input, context) => executeTool(tool, name, input, context),
                 permission,
+                beforeExecute,
               )
             : undefined
           const codeModeCatalog = !codeModeEnabled
@@ -343,21 +341,17 @@ const layer = Layer.effect(
               !whollyDisabled(tool.options?.permission ?? name, input.permissions),
           ),
         )
-        const callSeq = yield* Ref.make(0)
+        const context = (key: string): Tool.Context => ({
+          ...input.context,
+          id: Tool.CallID.make(`call_${input.context.messageID}_${key}`),
+        })
         return yield* CodeModeTool.check(
           { tools, namespaces: data.namespaces },
           input.code,
           input.bindings,
           input.limits,
-          (name, tool, toolInput) =>
-            Effect.gen(function* () {
-              const index = yield* Ref.getAndUpdate(callSeq, (value) => value + 1)
-              const context: Tool.Context = {
-                ...input.context,
-                id: Tool.CallID.make(`call_${input.context.messageID}_${index}`),
-              }
-              return yield* run(tool, name, toolInput, context)
-            }),
+          (name, tool, toolInput, key) => executeTool(tool, name, toolInput, context(key)),
+          (name, toolInput, key) => beforeExecute(name, toolInput, context(key)),
         )
       }),
     })

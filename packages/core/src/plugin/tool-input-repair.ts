@@ -28,11 +28,16 @@ export const Plugin = define({
   effect: (ctx) =>
     Effect.gen(function* () {
       const aliased = new Map<string, string>()
+      // Calls inside a Code Mode program share its call ID, and Code Mode reports their aliases itself.
+      const programs = new Set<string>()
       yield* ctx.tool.hook("execute.before", (event) =>
         Effect.gen(function* () {
           // The outer Code Mode tool is built per snapshot rather than registered, so it cannot be
           // looked up here. Its `{ code }` input is trivial; the tools it calls are repaired normally.
-          if (event.tool === "execute") return
+          if (event.tool === "execute") {
+            programs.add(event.id)
+            return
+          }
           const tools = yield* ctx.tool.list()
           const alias = aliases.get(event.tool)
           const tool =
@@ -40,7 +45,7 @@ export const Plugin = define({
             (alias === undefined ? undefined : tools.find((tool) => tool.id === alias))
           if (!tool) return
           if (tool.id !== event.tool) {
-            aliased.set(event.id, event.tool)
+            if (!programs.has(event.id)) aliased.set(event.id, event.tool)
             event.tool = tool.id
           }
           const schema = definition(tool).inputSchema
@@ -50,6 +55,7 @@ export const Plugin = define({
       )
       yield* ctx.tool.hook("execute.after", (event) =>
         Effect.sync(() => {
+          if (event.tool === "execute") programs.delete(event.id)
           const called = aliased.get(event.id)
           if (called === undefined) return
           aliased.delete(event.id)
