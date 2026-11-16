@@ -10,7 +10,8 @@ export const wildcard = "all"
 export const registry = {
   todo: "Enable the experimental todowrite tool.",
   media_blob: "Store new session media once in a deduplicated blob table instead of inline in every message row.",
-  schedules: "Enable experimental scheduled tasks that wake a session with a prompt.",
+  automations:
+    "Enable experimental automations: a trigger (a time, an interval or a cron) that sends a prompt or runs a Code Mode program.",
   artifacts: "Enable experimental artifacts backed by pluggable providers.",
   console_watches:
     "Watch Slack threads, GitHub pull requests, issues, commits and Actions runs, and the workspace's MCP servers' events through OpenCode Console, and wake sessions when they change.",
@@ -22,3 +23,8 @@ export const registry = {
 export type Key = keyof typeof registry
 
 export const optInOnly: ReadonlySet<Key> = new Set(["full_codemode"])
+
+/** Earlier names of a flag, still read from `experimental.<name>` and `OPENCODE_FLAGS` when the new key is unset. */
+export const aliases = {
+  schedules: "automations",
+} as const satisfies Record<string, Key>
